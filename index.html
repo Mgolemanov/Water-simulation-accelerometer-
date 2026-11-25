@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#090d16" />
+  <title>2D SPH Liquid Physics</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      overscroll-behavior: none;
+      background-color: #090d16;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      touch-action: none;          /* critical on Android: lets pointermove fire */
+    }
+    #overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(9, 13, 22, 0.88);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      z-index: 10;
+      color: #fff;
+      text-align: center;
+      padding: 24px;
+      touch-action: manipulation;
+    }
+    #overlay h2 { font-size: 22px; }
+    button {
+      padding: 16px 32px;
+      font-size: 18px;
+      font-weight: 700;
+      background: #00d2ff;
+      color: #090d16;
+      border: none;
+      border-radius: 50px;
+      cursor: pointer;
+      box-shadow: 0 4px 20px rgba(0, 210, 255, 0.4);
+      margin-top: 16px;
+      touch-action: manipulation;
+    }
+    button:active { transform: scale(0.97); }
+    #hint {
+      position: fixed;
+      top: calc(14px + env(safe-area-inset-top));
+      left: 16px;
+      color: rgba(255, 255, 255, 0.45);
+      font-size: 13px;
+      pointer-events: none;
+      z-index: 5;
+    }
+  </style>
+</head>
+<body>
+
+  <div id="overlay">
+    <h2>Interactive Liquid Physics</h2>
+    <p style="margin-top: 8px; opacity: 0.75; max-width: 300px;">
+      Tilt and shake your phone to slosh the liquid. You can also touch the screen to stir.
+    </p>
+    <button id="startBtn">Start Simulation</button>
+  </div>
+
+  <div id="hint">Tilt or shake device • Touch to stir</div>
+  <canvas id="simCanvas"></canvas>
+
+  <script>
+  (function () {
+    "use strict";
+
+    const canvas  = document.getElementById("simCanvas");
+    const ctx     = canvas.getContext("2d", { alpha: false });
+    const overlay = document.getElementById("overlay");
+    const startBtn = document.getElementById("startBtn");
+
+    // ---------------------------------------------------------------
+    // CANVAS SIZING (DPR aware so it isn't blurry on modern phones)
+    // ---------------------------------------------------------------
+    let width = 0, height = 0, dpr = 1;
+
+    function resizeCanvas() {
+      dpr = Math.min(window.devicePixelRatio || 1, 2); // cap at 2 for mobile perf
+      width  = window.innerWidth;
+      height = window.innerHeight;
+
+      canvas.width  = Math.round(width  * dpr);
+      canvas.height = Math.round(height * dpr);
+      canvas.style.width  = width  + "px";
+      canvas.style.height = height + "px";
+
+      // Resizing resets the transform — reapply it every time.
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.fillStyle = "#090d16";
+      ctx.fillRect(0, 0, width, height);
+    }
+
+    resizeCanvas();
+
+    // ---------------------------------------------------------------
+    // SPH FLUID PHYSICS PARAMETERS (Mobile Tuned)
+    // ---------------------------------------------------------------
+    const PARTICLE_COUNT   = 340;
+    const H                = 36;      // smoothing radius
+    const H2               = H * H;
+    const REST_DENSITY     = 1.4;
+    const STIFFNESS        = 38;
+    const NEAR_STIFFNESS   = 55;
+    const VISCOSITY        = 0.14;
+    const DAMPING          = 0.992;
+    const WALL_BOUNCE      = 0.45;
+    const PARTICLE_RADIUS  = 11;
+    const ACCEL_SCALE      = 68;      // m/s² -> px/s²
+    const MAX_SPEED        = 1800;    // px/s clamp
+    const MAX_G            = 40;      // clamp sensor gravity so shakes don't explode
+
+    // Gravity vector from the accelerometer (defaults to "down")
+    let gx = 0;
+    let gy = 9.81;
+
+    // Spatial hash grid
+    const cellSize = H;
+    const grid = new Map();
+
+    // Particle state — Structure of Arrays for speed on mobile
+    const x  = new Float32Array(PARTICLE_COUNT);
+    const y  = new Float32Array(PARTICLE_COUNT);
+    const vx = new Float32Array(PARTICLE_COUNT);
+    const vy = new Float32Array(PARTICLE_COUNT);
+    const fx = new Float32Array(PARTICLE_COUNT);
+    const fy = new Float32Array(PARTICLE_COUNT);
+    const density     = new Float32Array(PARTICLE_COUNT);
+    const nearDensity = new Float32Array(PARTICLE_COUNT);
+
+    // ---------------------------------------------------------------
+    // PARTICLE INITIALISATION
+    // ---------------------------------------------------------------
+    function initParticles() {
+      const spacing = PARTICLE_RADIUS * 1.6;
+      const cols = Math.max(1, Math.floor((width * 0.7) / spacing));
+      const startX = (width - cols * spacing) * 0.5;
+      const startY = height * 0.25;
+
+      for (let i = 0; i < PARTICLE_COUNT; i++) {
+        const col = i % cols;
+        const row = (i / cols) | 0;
+        x[i] = startX + col * spacing + (Math.random() - 0.5) * 4;
+        y[i] = startY + row * spacing + (Math.random() - 0.5) * 4;
+        vx[i] = 0;
+        vy[i] = 0;
+        fx[i] = 0;
+        fy[i] = 0;
+        density[i] = 0;
+        nearDensity[i] = 0;
+      }
+      // Keep everything inside the screen if the block was wider than the view
+      clampToBounds();
+    }
+
+    function clampToBounds() {
+      const m = PARTICLE_RADIUS;
+      for (let i = 0; i < PARTICLE_COUNT; i++) {
+        if (x[i] < m) x[i] = m;
+        else if (x[i] > width - m) x[i] = width - m;
+        if (y[i] < m) y[i] = m;
+        else if (y[i] > height - m) y[i] = height - m;
+      }
+    }
+
+    // ---------------------------------------------------------------
+    // POINTER / TOUCH INTERACTION
+    // ---------------------------------------------------------------
+    const pointer = {
+      x: 0, y: 0,       // current position
+      px: 0, py: 0,     // position at start of previous frame
+      dvx: 0, dvy: 0,   // frame velocity (px per frame)
+      active: false,
+      id: null
+    };
+
+    function pointerDown(e) {
+      if (pointer.active && pointer.id !== e.pointerId) return;
+      pointer.active = true;
+      pointer.id = e.pointerId;
+      pointer.x = pointer.px = e.clientX;
+      pointer.y = pointer.py = e.clientY;
+      pointer.dvx = pointer.dvy = 0;
+      if (canvas.setPointerCapture) {
+        try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+      }
+      e.preventDefault();
+    }
+
+    function pointerMove(e) {
+      if (!pointer.active || e.pointerId !== pointer.id) return;
+      pointer.x = e.clientX;
+      pointer.y = e.clientY;
+      e.preventDefault();
+    }
+
+    function pointerUp(e) {
+      if (pointer.id !== null && e.pointerId !== pointer.id) return;
+      pointer.active = false;
+      pointer.id = null;
+      pointer.dvx = pointer.dvy = 0;
+    }
+
+    canvas.addEventListener("pointerdown", pointerDown, { passive: false });
+    canvas.addEventListener("pointermove", pointerMove, { passive: false });
+    canvas.addEventListener("pointerup", pointerUp);
+    canvas.addEventListener("pointercancel", pointerUp);
+    window.addEventListener("blur", pointerUp);
+
+    // ---------------------------------------------------------------
+    // PHYSICS STEP
+    // ---------------------------------------------------------------
+    function stepPhysics(dt) {
+      const m = PARTICLE_RADIUS;
+
+      // --- 1. Build spatial hash grid -------------------------------
+      grid.clear();
+      for (let i = 0; i < PARTICLE_COUNT; i++) {
+        const cx = (x[i] / cellSize) | 0;
+        const cy = (y[i] / cellSize) | 0;
+        const key = ((cx + 4096) << 16) ^ (cy + 4096); // offset => safe for any coord
+        let cell = grid.get(key);
+        if (!cell) {
+          cell = [];
+          grid.set(key, cell);
+        }
+        cell.push(i);
+      }
+
+      // --- 2. Density & near-density --------------------------------
+      for (let i = 0; i < PARTICLE_COUNT; i++) {
+        let d = 0, nd = 0;
+        const cx = (x[i] / cellSize) | 0;
+        const cy = (y[i] / cellSize) | 0;
+
+        for (let ox = -1; ox <= 1; ox++) {
+          for (let oy = -1; oy <= 1; oy++) {
+            const cell = grid.get(((cx + ox + 4096) << 16) ^ (cy + oy + 4096));
+            if (!cell) continue;
+
+            for (let k = 0; k < cell.length; k++) {
+              const j = cell[k];
+              const dx = x[j] - x[i];
+              const dy = y[j] - y[i];
+              const r2 = dx * dx + dy * dy;
+
+              if (r2 < H2 && r2 > 1e-4) {
+                const q = 1 - Math.sqrt(r2) / H;
+                const q2 = q * q;
+                d  += q2;
+                nd += q2 * q;
+              }
+            }
+          }
+        }
+        density[i] = d;
+        nearDensity[i] = nd;
+        fx[i] = 0;
+        fy[i] = 0;
+      }
+
+      // --- 3. Pressure & viscosity forces ---------------------------
+      for (let i = 0; i < PARTICLE_COUNT; i++) {
+        const pressure     = STIFFNESS * (density[i] - REST_DENSITY);
+        const nearPressure = NEAR_STIFFNESS * nearDensity[i];
+        const cx = (x[i] / cellSize) | 0;
+        const cy = (y[i] / cellSize) | 0;
+
+        for (let ox = -1; ox <= 1; ox++) {
+          for (let oy = -1; oy <= 1; oy++) {
+            const cell = grid.get(((cx + ox + 4096) << 16) ^ (cy + oy + 4096));
+            if (!cell) continue;
+
+            for (let k = 0; k < cell.length; k++) {
+              const j = cell[k];
+              if (i === j) continue;
+
+              const dx = x[j] - x[i];
+              const dy = y[j] - y[i];
+              const r2 = dx * dx + dy * dy;
+
+              if (r2 < H2 && r2 > 1e-4) {
+                const r    = Math.sqrt(r2);
+                const invR = 1 / r;
+                const nx = dx * invR;
+                const ny = dy * invR;
+                const q  = 1 - r / H;
+
+                const pJ     = STIFFNESS * (density[j] - REST_DENSITY);
+                const npJ    = NEAR_STIFFNESS * nearDensity[j];
+                const total  = (pressure + pJ) * 0.5 * q + (nearPressure + npJ) * 0.5 * q * q;
+
+                fx[i] -= nx * total;
+                fy[i] -= ny * total;
+
+                const visc = VISCOSITY * q;
+                fx[i] += (vx[j] - vx[i]) * visc;
+                fy[i] += (vy[j] - vy[i]) * visc;
+              }
+            }
+          }
+        }
+      }
+
+      // --- 4. Integrate, apply gravity / touch, resolve walls -------
+      const gravityX = gx * ACCEL_SCALE;
+      const gravityY = gy * ACCEL_SCALE;
+
+      // Finger "sweep" velocity, converted to a per-second impulse
+      const stirX = pointer.active ? pointer.dvx * 18 * 15 : 0;
+      const stirY = pointer.active ? pointer.dvy * 18 * 15 : 0;
+      const touchRadius2 = 3600; // 60px
+
+      for (let i = 0; i < PARTICLE_COUNT; i++) {
+        vx[i] += (fx[i] + gravityX) * dt;
+        vy[i] += (fy[i] + gravityY) * dt;
+
+        if (pointer.active) {
+          const dx = x[i] - pointer.x;
+          const dy = y[i] - pointer.y;
+          if (dx * dx + dy * dy < touchRadius2) {
+            vx[i] += stirX * dt;
+            vy[i] += stirY * dt;
+          }
+        }
+
+        vx[i] *= DAMPING;
+        vy[i] *= DAMPING;
+
+        // Clamp extreme velocities during violent shakes
+        const speed2 = vx[i] * vx[i] + vy[i] * vy[i];
+        if (speed2 > MAX_SPEED * MAX_SPEED) {
+          const s = MAX_SPEED / Math.sqrt(speed2);
+          vx[i] *= s;
+          vy[i] *= s;
+        }
+
+        x[i] += vx[i] * dt;
+        y[i] += vy[i] * dt;
+
+        // Solid screen edges
+        if (x[i] < m)          { x[i] = m;          vx[i] *= -WALL_BOUNCE; }
+        else if (x[i] > width - m)  { x[i] = width - m;  vx[i] *= -WALL_BOUNCE; }
+
+        if (y[i] < m)          { y[i] = m;          vy[i] *= -WALL_BOUNCE; }
+        else if (y[i] > height - m) { y[i] = height - m; vy[i] *= -WALL_BOUNCE; }
+      }
+    }
+
+    // ---------------------------------------------------------------
+    // RENDERING (Liquid Glow & Splash Highlights)
+    // ---------------------------------------------------------------
+    function render() {
+      ctx.globalCompositeOperation = "source-over";
+      ctx.fillStyle = "#090d16";
+      ctx.fillRect(0, 0, width, height);
+
+      // Additive blending merges overlapping particles into one fluid body
+      ctx.globalCompositeOperation = "lighter";
+
+      for (let i = 0; i < PARTICLE_COUNT; i++) {
+        const speed = Math.hypot(vx[i], vy[i]);
+        const splash = speed > 650 * 0.45 ? Math.min(speed / 650, 1) : 0;
+
+        // *** THE FIX: quoted strings, not bare identifiers ***
+        ctx.fillStyle = splash > 0.45
+          ? "rgba(140, 240, 255, 0.55)"
+          : "rgba(0, 135, 220, 0.48)";
+
+        ctx.beginPath();
+        ctx.arc(x[i], y[i], PARTICLE_RADIUS * 1.45, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // Bright inner core for depth
+      ctx.fillStyle = "rgba(90, 210, 255, 0.35)";
+      for (let i = 0; i < PARTICLE_COUNT; i++) {
+        ctx.beginPath();
+        ctx.arc(x[i], y[i], PARTICLE_RADIUS * 0.7, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      ctx.globalCompositeOperation = "source-over";
+    }
+
+    // ---------------------------------------------------------------
+    // MAIN LOOP
+    // ---------------------------------------------------------------
+    let running = false;
+    let lastTime = 0;
+
+    function loop(now) {
+      if (!running) return;
+
+      if (!lastTime) lastTime = now;
+      let frameDt = (now - lastTime) / 1000;
+      lastTime = now;
+
+      // Guard against tab-switch spikes & slow first frames
+      if (!isFinite(frameDt) || frameDt <= 0) frameDt = 1 / 60;
+      if (frameDt > 1 / 30) frameDt = 1 / 30;
+
+      // Finger velocity is measured once per frame (not per sub-step)
+      if (pointer.active) {
+        pointer.dvx = pointer.x - pointer.px;
+        pointer.dvy = pointer.y - pointer.py;
+      } else {
+        pointer.dvx = pointer.dvy = 0;
+      }
+
+      // 3 sub-steps keep high-speed impacts and splashes stable
+      const subSteps = 3;
+      const dt = frameDt / subSteps;
+      for (let s = 0; s < subSteps; s++) stepPhysics(dt);
+
+      // Advance stored pointer position for next frame's velocity
+      if (pointer.active) {
+        pointer.px = pointer.x;
+        pointer.py = pointer.y;
+      }
+
+      render();
+      requestAnimationFrame(loop);
+    }
+
+    // ---------------------------------------------------------------
+    // ACCELEROMETER
+    // ---------------------------------------------------------------
+    function handleMotion(event) {
+      const acc = event.accelerationIncludingGravity || event.acceleration;
+      if (!acc || acc.x === null || acc.x === undefined) return;
+
+      // Android: accelerometer X is inverted relative to screen X.
+      let tx = -acc.x;
+      let ty = (acc.y === null || acc.y === undefined) ? 9.81 : acc.y;
+
+      // Phone lying flat -> x/y ~ 0, fall back to "screen down"
+      if (Math.hypot(tx, ty) < 2.5) { tx = 0; ty = 9.81; }
+
+      // Clamp so a violent shake can't blow the solver up
+      tx = Math.max(-MAX_G, Math.min(MAX_G, tx));
+      ty = Math.max(-MAX_G, Math.min(MAX_G, ty));
+
+      // Low-pass filter: kills sensor jitter, keeps sharp shakes
+      gx += (tx - gx) * 0.35;
+      gy += (ty - gy) * 0.35;
+    }
+
+    async function enableMotion() {
+      if (typeof DeviceMotionEvent === "undefined") return;
+      // iOS 13+ permission gate (harmless on Android)
+      if (typeof DeviceMotionEvent.requestPermission === "function") {
+        try {
+          const permission = await DeviceMotionEvent.requestPermission();
+          if (permission !== "granted") return;
+        } catch (err) {
+          console.warn("DeviceMotion permission failed:", err);
+          return;
+        }
+      }
+      window.addEventListener("devicemotion", handleMotion, { passive: true });
+    }
+
+    // ---------------------------------------------------------------
+    // START
+    // ---------------------------------------------------------------
+    startBtn.addEventListener("click", async () => {
+      if (running) return;
+      running = true;
+      overlay.style.display = "none";
+
+      await enableMotion();
+
+      resizeCanvas();
+      initParticles();
+
+      lastTime = 0;
+      requestAnimationFrame(loop);
+    });
+
+    // Keep the sim consistent through rotation / browser UI resizes
+    let resizeTimer = null;
+    window.addEventListener("resize", () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        resizeCanvas();
+        if (running) clampToBounds();
+      }, 120);
+    });
+
+    window.addEventListener("orientationchange", () => {
+      setTimeout(() => { resizeCanvas(); if (running) clampToBounds(); }, 250);
+    });
+
+  })();
+  </script>
+</body>
+</html>
